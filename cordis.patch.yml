@@ -1,0 +1,9 @@
+# dsh-skill-install bundle layer.
+#
+# Mounts the host plugin (GitHub skill lookup + install bookkeeping + the local
+# JSON API under /skill-install/*). The package's browser half (client.js) is
+# picked up automatically by the client-modules scanner from this same entry
+# name because package.json declares dsh.client, so no separate row is needed.
+- insert:
+    - id: skill-install
+      name: dsh-skill-install
