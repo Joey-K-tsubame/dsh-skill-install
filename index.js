@@ -190,6 +190,16 @@ export function apply(ctx) {
     if (text.length > maxChars) throw new Error('响应过大（' + text.length + ' 字符），已截断')
     return JSON.parse(text)
   }
+  /** 给抓取加独立超时；raw.githubusercontent.com 在国内常无响应，不能等满 45 秒。 */
+  function withTimeout(promise, ms, message) {
+    return new Promise((resolvePromise, rejectPromise) => {
+      const timer = setTimeout(() => rejectPromise(new Error(message ?? '请求超时')), ms)
+      promise.then(
+        (value) => { clearTimeout(timer); resolvePromise(value) },
+        (error) => { clearTimeout(timer); rejectPromise(error) },
+      )
+    })
+  }
 
   // ------------------------------------------------------------ frontmatter
   function parseFrontmatter(text) {
@@ -360,7 +370,7 @@ export function apply(ctx) {
         const rawPath = dir === '.' ? 'SKILL.md' : dir + '/SKILL.md'
         try {
           const rawUrl = GH_RAW + '/' + fullName + '/' + encodeURIComponent(commit) + '/' + rawPath.split('/').map(encodeURIComponent).join('/')
-          const text = await ghText(rawUrl)
+          const text = await withTimeout(ghText(rawUrl), 8000, 'raw 抓取超时（国内网络常见）')
           const parsed = parseFrontmatter(text)
           if (!parsed) return null
           const name = typeof parsed.data.name === 'string' ? parsed.data.name.trim() : ''
