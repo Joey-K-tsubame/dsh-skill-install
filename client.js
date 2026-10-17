@@ -45,7 +45,16 @@ window.__ModuleLoader__.load({
       const s = sp.toString();
       return s ? "?" + s : "";
     }
+    // Mutating endpoints accept POST + JSON only; reads stay GET with a query.
+    const WRITE_PATHS = new Set(["install", "remove", "proxy", "token"]);
     function api(path, params) {
+      if (WRITE_PATHS.has(path)) {
+        return fetch("/skill-install/" + path, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(params ?? {}),
+        }).then((r) => r.json());
+      }
       return fetch("/skill-install/" + path + qs(params)).then((r) => r.json());
     }
 

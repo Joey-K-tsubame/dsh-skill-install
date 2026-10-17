@@ -12,11 +12,13 @@
  * @module dsh-skill-install
  */
 
+import { randomBytes } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, watch } from 'node:fs'
-import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, watch } from 'node:fs'
+import { chmod, cp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve, sep } from 'node:path'
+import { URL } from 'node:url'
 import yaml from './js-yaml.mjs'
 
 const GH_API = 'https://api.github.com'
@@ -92,6 +94,9 @@ export function apply(ctx) {
   function saveSettings(next) {
     mkdirSync(dshHomeDir(), { recursive: true })
     writeFileSync(settingsPath(), JSON.stringify(next, null, 2) + '\n', 'utf8')
+    // The file carries the optional GitHub token: keep it owner-only. On Windows
+    // this only toggles the read-only attribute, hence the best-effort catch.
+    void chmod(settingsPath(), 0o600).catch(() => {})
   }
   function customDirs() {
     return loadSettings().customDirs.map(expandHome).filter((d) => d !== '' && d !== '.')
@@ -302,12 +307,19 @@ export function apply(ctx) {
     skills.sort((a, b) => (a.name < b.name ? -1 : 1))
     return skills
   }
+  /** 固定仓库默认分支的 commit；后续 tree / raw / tarball 一律用这个 SHA。 */
+  async function headCommit(fullName, branch) {
+    const data = await ghJson(GH_API + '/repos/' + fullName + '/commits/' + encodeURIComponent(branch), 800000)
+    const sha = data !== null && typeof data === 'object' && typeof data.sha === 'string' ? data.sha : ''
+    if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error('无法固定仓库 commit：' + fullName + '@' + branch)
+    return sha
+  }
   /** 下载仓库 tarball 到本地解压后扫描——不依赖 raw.githubusercontent.com。 */
-  async function listSkillsFromTarball(fullName, branch) {
+  async function listSkillsFromTarball(fullName, ref) {
     const work = join(dshHomeDir(), SRC_DIR_NAME, 'list-' + Date.now().toString(36) + '-' + basename(fullName))
     await mkdir(work, { recursive: true })
     try {
-      await downloadExtract(fullName, branch, work)
+      await downloadExtract(fullName, ref, work)
       return scanSkillsInTree(work, basename(fullName))
     } finally {
       rmSync(work, { recursive: true, force: true })
@@ -316,11 +328,11 @@ export function apply(ctx) {
   /** 列出仓库里的全部 SKILL.md 技能。先走树 API + raw，失败或不全时用本地 tarball 兜底。 */
   async function repoSkills(fullName) {
     const meta = await repoMeta(fullName)
-    const branch = meta.defaultBranch
+    const commit = await headCommit(fullName, meta.defaultBranch)
     let dirs = []
     let treeError = ''
     try {
-      const treeUrl = GH_API + '/repos/' + fullName + '/git/trees/' + encodeURIComponent(branch) + '?recursive=1'
+      const treeUrl = GH_API + '/repos/' + fullName + '/git/trees/' + encodeURIComponent(commit) + '?recursive=1'
       const data = await ghJson(treeUrl, 3000000)
       const tree = Array.isArray(data.tree) ? data.tree : []
       const seen = new Set()
@@ -347,7 +359,7 @@ export function apply(ctx) {
       const results = await Promise.all(dirs.slice(0, 24).map(async (dir) => {
         const rawPath = dir === '.' ? 'SKILL.md' : dir + '/SKILL.md'
         try {
-          const rawUrl = GH_RAW + '/' + fullName + '/' + encodeURIComponent(branch) + '/' + rawPath.split('/').map(encodeURIComponent).join('/')
+          const rawUrl = GH_RAW + '/' + fullName + '/' + encodeURIComponent(commit) + '/' + rawPath.split('/').map(encodeURIComponent).join('/')
           const text = await ghText(rawUrl)
           const parsed = parseFrontmatter(text)
           if (!parsed) return null
@@ -372,7 +384,7 @@ export function apply(ctx) {
     let listError = ''
     if (skills.length === 0 && (dirs.length > 0 || treeError !== '')) {
       try {
-        const fromTar = await listSkillsFromTarball(fullName, branch)
+        const fromTar = await listSkillsFromTarball(fullName, commit)
         if (fromTar.length > 0) {
           skills = fromTar
           treeError = ''
@@ -385,7 +397,7 @@ export function apply(ctx) {
     }
 
     skills.sort((a, b) => (a.name < b.name ? -1 : 1))
-    return { meta, skills, truncated: dirs.length > 24, treeError, listError }
+    return { meta, commit, skills, truncated: dirs.length > 24, treeError, listError }
   }
 
   // -------------------------------------------------------------- 目标目录
@@ -418,9 +430,56 @@ export function apply(ctx) {
   }
 
   // ------------------------------------------------------------ 安装 / 移除
-  async function downloadExtract(fullName, branch, destDir) {
+  /** 压缩包与解压产物的准入上限。 */
+  const MAX_TARBALL_BYTES = 64 * 1024 * 1024
+  const MAX_TREE_BYTES = 256 * 1024 * 1024
+  const MAX_TREE_ENTRIES = 20000
+  const DIR_SEGMENT_RE = /^[A-Za-z0-9._-]+$/
+
+  /** 校验请求里的相对技能目录：拒绝绝对路径、`..`、反斜杠与空段。 */
+  function assertSkillDir(dir) {
+    if (typeof dir !== 'string' || dir === '' || dir.length > 200) throw new Error('技能目录无效：' + String(dir))
+    if (dir === '.') return '.'
+    for (const seg of dir.split('/')) {
+      if (seg === '' || seg === '.' || seg === '..' || !DIR_SEGMENT_RE.test(seg)) throw new Error('技能目录越界：' + dir)
+    }
+    return dir
+  }
+
+  /** 解压产物准入：删除符号链接，限制条目数与解压后总体积。 */
+  function sanitizeTree(rootDir) {
+    const root = realpathSync(rootDir)
+    let entries = 0
+    let bytes = 0
+    const walk = (dir) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const abs = join(dir, entry.name)
+        entries += 1
+        if (entries > MAX_TREE_ENTRIES) throw new Error('解压内容条目过多（上限 ' + MAX_TREE_ENTRIES + '）')
+        const info = lstatSync(abs)
+        if (info.isSymbolicLink()) {
+          rmSync(abs, { force: true })
+          continue
+        }
+        if (info.isDirectory()) {
+          walk(abs)
+          continue
+        }
+        if (!info.isFile()) {
+          rmSync(abs, { recursive: true, force: true })
+          continue
+        }
+        bytes += info.size
+        if (bytes > MAX_TREE_BYTES) throw new Error('解压内容超过体积上限')
+      }
+    }
+    walk(root)
+  }
+
+  async function downloadExtract(fullName, ref, destDir) {
+    if (!/^[0-9a-f]{40}$/.test(ref)) throw new Error('安装源必须是固定 commit：' + String(ref))
     const tarball = join(destDir, 'repo.tar.gz')
-    const url = GH_CODELOAD + '/' + fullName + '/tar.gz/refs/heads/' + encodeURIComponent(branch)
+    const url = GH_CODELOAD + '/' + fullName + '/tar.gz/' + ref
     const proxy = proxyOf()
     if (proxy !== '') {
       if (!probeCurl()) throw new Error('已配置代理，但宿主未找到 curl')
@@ -442,51 +501,74 @@ export function apply(ctx) {
       try {
         const res = await fetch(url, { headers: { 'user-agent': 'dsh-skill-install' }, signal: controller.signal })
         if (!res.ok) throw new Error('HTTP ' + res.status)
+        const declared = Number(res.headers.get('content-length'))
+        if (Number.isFinite(declared) && declared > MAX_TARBALL_BYTES) throw new Error('压缩包超过体积上限')
         const buf = Buffer.from(await res.arrayBuffer())
+        if (buf.length > MAX_TARBALL_BYTES) throw new Error('压缩包超过体积上限')
         await writeFile(tarball, buf)
       } finally {
         clearTimeout(timer)
       }
     }
+    if (statSync(tarball).size > MAX_TARBALL_BYTES) throw new Error('压缩包超过体积上限')
     const result = spawnSync('tar', ['-xzf', tarball, '-C', destDir, '--strip-components=1'], { timeout: 120000 })
     if (result.status !== 0) {
       const detail = (result.stderr && result.stderr.toString().trim()) || ('tar 退出码 ' + result.status)
       throw new Error('解压失败：' + detail)
     }
+    sanitizeTree(destDir)
   }
+
   async function installSkills(fullName, dirs, rootKey, customPath) {
     const meta = await repoMeta(fullName)
+    const commit = await headCommit(fullName, meta.defaultBranch)
     const target = rootTarget(rootKey, customPath)
     const work = join(dshHomeDir(), SRC_DIR_NAME, Date.now().toString(36) + '-' + basename(fullName))
     await mkdir(work, { recursive: true })
     const installed = []
+    const committed = []
+    let targetRoot = ''
     try {
-      await downloadExtract(fullName, meta.defaultBranch, work)
-      for (const dir of dirs) {
-        const srcDir = dir === '.' ? work : join(work, ...dir.split('/'))
-        const skillMd = join(srcDir, 'SKILL.md')
+      await downloadExtract(fullName, commit, work)
+      const workRoot = realpathSync(work)
+      await mkdir(target.path, { recursive: true })
+      targetRoot = realpathSync(target.path)
+      for (const rawDir of dirs) {
+        const dir = assertSkillDir(rawDir)
+        const srcDir = dir === '.' ? workRoot : resolve(join(workRoot, ...dir.split('/')))
+        if (srcDir !== workRoot && !srcDir.startsWith(workRoot + sep)) throw new Error('技能目录越界：' + rawDir)
+        const realSrc = realpathSync(srcDir)
+        if (realSrc !== workRoot && !realSrc.startsWith(workRoot + sep)) throw new Error('技能目录越界（链接）：' + rawDir)
+        const skillMd = join(realSrc, 'SKILL.md')
         if (!existsSync(skillMd)) throw new Error('技能目录缺少 SKILL.md：' + (dir === '.' ? fullName : dir))
         const parsed = parseFrontmatter(readFileSync(skillMd, 'utf8'))
         if (!parsed) throw new Error('技能 frontmatter 无效：' + (dir === '.' ? fullName : dir))
         const name = typeof parsed.data.name === 'string' && SKILL_NAME_RE.test(parsed.data.name.trim()) ? parsed.data.name.trim() : (dir === '.' ? basename(fullName) : basename(dir))
         if (!SKILL_NAME_RE.test(name)) throw new Error('技能名称无效：' + name)
-        await mkdir(target.path, { recursive: true })
-        const targetDir = safeJoin(target.path, name)
-        if (existsSync(targetDir)) throw new Error('技能已存在：' + name + '（' + target.path + '）')
-        await cp(srcDir, targetDir, { recursive: true, dereference: false })
-        installed.push({ name, dir: name, root: target.path, scope: rootKey, source: fullName, time: new Date().toISOString() })
+        const targetDir = safeJoin(targetRoot, name)
+        if (existsSync(targetDir)) throw new Error('技能已存在：' + name + '（' + targetRoot + '）')
+        // 先复制到同目录的临时名，再原子改名提交；中途失败不会留下半装的技能。
+        const staging = join(targetRoot, '.install-' + name + '-' + randomBytes(4).toString('hex'))
+        await cp(realSrc, staging, { recursive: true, dereference: false })
+        await rename(staging, targetDir)
+        committed.push(targetDir)
+        installed.push({ name, dir: name, root: targetRoot, scope: rootKey, source: fullName, commit, time: new Date().toISOString() })
       }
       const settings = loadSettings()
       if (target.custom) {
-        const resolvedCustom = target.path
-        if (!settings.customDirs.some((d) => resolve(expandHome(d)) === resolvedCustom)) settings.customDirs.push(resolvedCustom)
-        startCustomWatcher(resolvedCustom)
+        if (!settings.customDirs.some((d) => resolve(expandHome(d)) === targetRoot)) settings.customDirs.push(targetRoot)
+        startCustomWatcher(targetRoot)
       }
       settings.installed = settings.installed.filter((r) => !installed.some((n) => n.name === r.name && n.root === r.root))
       settings.installed.push(...installed)
       saveSettings(settings)
       invalidateCustom()
-      return { ok: true, installed }
+      return { ok: true, commit, installed }
+    } catch (error) {
+      for (const dir of committed) {
+        try { rmSync(dir, { recursive: true, force: true }) } catch { /* best effort */ }
+      }
+      throw error
     } finally {
       rmSync(work, { recursive: true, force: true })
     }
@@ -601,24 +683,114 @@ export function apply(ctx) {
   }
 
   // --------------------------------------------------- 本地 JSON API 路由
-  function sendJson(res, value) {
+  /** 本机载体只监听环回地址；非环回 Host 一律拒绝。 */
+  const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1', '0:0:0:0:0:0:0:1'])
+  const MAX_BODY_BYTES = 16 * 1024
+
+  function hostnameOf(hostHeader) {
+    const host = String(hostHeader).toLowerCase()
+    if (host.startsWith('[')) {
+      const end = host.indexOf(']')
+      return end > 0 ? host.slice(0, end + 1) : ''
+    }
+    const colon = host.lastIndexOf(':')
+    return colon > 0 ? host.slice(0, colon) : host
+  }
+  /** 只接受本机同源调用：环回 Host、非跨站、Origin 与 Host 一致。 */
+  function trustedCaller(req) {
+    const hostHeader = req.headers?.host
+    if (typeof hostHeader !== 'string' || hostHeader === '') return false
+    if (!LOOPBACK_HOSTS.has(hostnameOf(hostHeader))) return false
+    const site = req.headers['sec-fetch-site']
+    if (typeof site === 'string' && site !== 'same-origin' && site !== 'none') return false
+    const origin = req.headers.origin
+    if (typeof origin === 'string' && origin !== '') {
+      let parsed
+      try {
+        parsed = new URL(origin)
+      } catch {
+        return false
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
+      if (parsed.host.toLowerCase() !== hostHeader.toLowerCase()) return false
+    }
+    return true
+  }
+  function sendJson(res, value, status = 200) {
     const body = JSON.stringify(value)
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
     res.end(body)
   }
+  function reject(res, status, code, message, headers = {}) {
+    for (const [name, value] of Object.entries(headers)) res.setHeader(name, value)
+    sendJson(res, { ok: false, error: message, code }, status)
+  }
+  /** 读取有界 JSON 正文；超过上限或不是 JSON 时带 statusCode 抛出。 */
+  async function readBoundedJson(req) {
+    const declared = Number(req.headers?.['content-length'])
+    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+      const error = new Error('请求正文超过 ' + MAX_BODY_BYTES + ' 字节上限')
+      error.statusCode = 413
+      throw error
+    }
+    const chunks = []
+    let total = 0
+    for await (const chunk of req) {
+      total += chunk.length
+      if (total > MAX_BODY_BYTES) {
+        const error = new Error('请求正文超过 ' + MAX_BODY_BYTES + ' 字节上限')
+        error.statusCode = 413
+        throw error
+      }
+      chunks.push(chunk)
+    }
+    const text = Buffer.concat(chunks).toString('utf8')
+    if (text.trim() === '') return {}
+    let value
+    try {
+      value = JSON.parse(text)
+    } catch {
+      const error = new Error('请求正文不是合法 JSON')
+      error.statusCode = 400
+      throw error
+    }
+    return value !== null && typeof value === 'object' ? value : {}
+  }
+  function registerRoute(path, handler) {
+    ctx.effect(() => webServer.register({ kind: 'exact', path, handler }), `skill-install: ${path}`)
+  }
+  /** 只读路由：GET，query 传参。 */
+  function routeRead(path, fn) {
+    registerRoute(path, async (req, res) => {
+      if (req.method !== 'GET') return reject(res, 405, 'method-not-allowed', 'GET only', { Allow: 'GET' })
+      if (!trustedCaller(req)) return reject(res, 403, 'untrusted-caller', '仅接受本机同源调用')
+      try {
+        const params = new URL(req.url ?? '/', 'http://skill-install.local').searchParams
+        sendJson(res, await fn(params))
+      } catch (error) {
+        sendJson(res, { ok: false, error: error instanceof Error ? error.message : String(error), code: 'skill-install/failed' }, 400)
+      }
+    })
+  }
+  /** 写入路由：POST + application/json + 有界正文。 */
+  function routeWrite(path, fn) {
+    registerRoute(path, async (req, res) => {
+      if (req.method !== 'POST') return reject(res, 405, 'method-not-allowed', 'POST only', { Allow: 'POST' })
+      if (!trustedCaller(req)) return reject(res, 403, 'untrusted-caller', '仅接受本机同源调用')
+      if (!/^application\/json\b/i.test(String(req.headers?.['content-type'] ?? ''))) {
+        return reject(res, 415, 'unsupported-media-type', '只接受 application/json')
+      }
+      try {
+        sendJson(res, await fn(await readBoundedJson(req)))
+      } catch (error) {
+        const status = typeof error?.statusCode === 'number' ? error.statusCode : 400
+        sendJson(res, { ok: false, error: error instanceof Error ? error.message : String(error), code: 'skill-install/failed' }, status)
+      }
+    })
+  }
+  /** 只读路由的简写；旧的 `route(...)` 调用点全部落在这一类。 */
   function route(path, fn) {
-    ctx.effect(() => webServer.register({
-      kind: 'exact',
-      path,
-      handler: async (req, res) => {
-        try {
-          const params = new URL(req.url ?? '/', 'http://skill-install.local').searchParams
-          sendJson(res, await fn(params))
-        } catch (error) {
-          sendJson(res, { ok: false, error: error instanceof Error ? error.message : String(error) })
-        }
-      },
-    }), `skill-install: ${path}`)
+    routeRead(path, fn)
   }
 
   route('/skill-install/resolve', async (params) => {
@@ -642,20 +814,21 @@ export function apply(ctx) {
 
   route('/skill-install/roots', async () => ({ ok: true, ...rootsSummary() }))
 
-  route('/skill-install/install', async (params) => {
-    const fullName = (params.get('repo') ?? '').trim()
-    const dirs = (params.get('dirs') ?? '').split(',').map((s) => s.trim()).filter((s) => s !== '')
-    const rootKey = (params.get('root') ?? 'global').trim()
-    const customPath = (params.get('customPath') ?? '').trim()
+  routeWrite('/skill-install/install', async (body) => {
+    const fullName = String(body.repo ?? '').trim()
+    const dirs = String(body.dirs ?? '').split(',').map((s) => s.trim()).filter((s) => s !== '')
+    const rootKey = String(body.root ?? 'global').trim()
+    const customPath = String(body.customPath ?? '').trim()
     if (!REPO_RE.test(fullName)) throw new Error('仓库名无效：' + fullName)
     if (dirs.length === 0) throw new Error('未选择要安装的技能')
+    if (dirs.length > 20) throw new Error('一次最多安装 20 个技能')
     return await installSkills(fullName, dirs, rootKey, customPath)
   })
 
-  route('/skill-install/remove', async (params) => {
-    const rootKey = (params.get('root') ?? 'global').trim()
-    const customPath = (params.get('customPath') ?? '').trim()
-    const dir = (params.get('dir') ?? '').trim()
+  routeWrite('/skill-install/remove', async (body) => {
+    const rootKey = String(body.root ?? 'global').trim()
+    const customPath = String(body.customPath ?? '').trim()
+    const dir = String(body.dir ?? '').trim()
     return await removeSkill(rootKey, customPath, dir)
   })
 
@@ -676,28 +849,24 @@ export function apply(ctx) {
     return { ok: true, items }
   })
 
-  route('/skill-install/proxy', async (params) => {
+  routeWrite('/skill-install/proxy', async (body) => {
     const settings = loadSettings()
-    const set = params.get('set')
-    const clear = params.get('clear')
-    if (set !== null) {
-      settings.proxy = set.trim()
+    if (typeof body.set === 'string') {
+      settings.proxy = body.set.trim()
       saveSettings(settings)
-    } else if (clear !== null) {
+    } else if (body.clear !== undefined) {
       settings.proxy = ''
       saveSettings(settings)
     }
     return { ok: true, proxy: settings.proxy, curl: probeCurl() }
   })
 
-  route('/skill-install/token', async (params) => {
+  routeWrite('/skill-install/token', async (body) => {
     const settings = loadSettings()
-    const set = params.get('set')
-    const clear = params.get('clear')
-    if (set !== null) {
-      settings.githubToken = set.trim()
+    if (typeof body.set === 'string') {
+      settings.githubToken = body.set.trim()
       saveSettings(settings)
-    } else if (clear !== null) {
+    } else if (body.clear !== undefined) {
       settings.githubToken = ''
       saveSettings(settings)
     }

@@ -5,6 +5,10 @@
   "type": "module",
   "main": "index.js",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Joey-K-tsubame/dsh-skill-install.git"
+  },
   "icon": "./icon.svg",
   "keywords": [
     "dsh",
@@ -31,10 +35,16 @@
     "./locale/*.json": "./locale/*.json"
   },
   "engines": {
+    "node": "^22.19.0 || >=24.0.0",
     "dsh": "^0.2.0-rc.2"
   },
   "dsh": {
     "manifestVersion": 1,
+    "compatibility": {
+      "dshReleases": {
+        "0.2.0-rc.2": "compatible"
+      }
+    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
