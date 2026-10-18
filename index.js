@@ -486,6 +486,28 @@ export function apply(ctx) {
     walk(root)
   }
 
+  /** 解压前审计归档成员：拒绝绝对路径、`..`、链接与非常规类型。 */
+  function inspectArchive(tarball) {
+    const listing = spawnSync('tar', ['-tzf', tarball], { timeout: 60000, maxBuffer: 32 * 1024 * 1024 })
+    if (listing.status !== 0) throw new Error('归档清单读取失败')
+    const names = String(listing.stdout).split(/\r?\n/).filter((line) => line !== '')
+    if (names.length > MAX_TREE_ENTRIES) throw new Error('归档条目过多（上限 ' + MAX_TREE_ENTRIES + '）')
+    for (const name of names) {
+      if (name.startsWith('/') || /^[A-Za-z]:/.test(name) || name.includes('\\')) {
+        throw new Error('归档包含绝对路径成员（' + name + '）')
+      }
+      if (name.split('/').includes('..')) throw new Error('归档包含越界成员（' + name + '）')
+    }
+    const verbose = spawnSync('tar', ['-tvzf', tarball], { timeout: 60000, maxBuffer: 32 * 1024 * 1024 })
+    if (verbose.status !== 0) throw new Error('归档清单读取失败')
+    for (const line of String(verbose.stdout).split(/\r?\n/)) {
+      if (line === '') continue
+      const type = line[0]
+      if (type === 'l' || type === 'h') throw new Error('归档包含链接成员，已拒绝')
+      if (type !== '-' && type !== 'd') throw new Error('归档包含非常规成员，已拒绝')
+    }
+  }
+
   async function downloadExtract(fullName, ref, destDir) {
     if (!/^[0-9a-f]{40}$/.test(ref)) throw new Error('安装源必须是固定 commit：' + String(ref))
     const tarball = join(destDir, 'repo.tar.gz')
@@ -496,7 +518,7 @@ export function apply(ctx) {
       await new Promise((resolvePromise, reject) => {
         let child
         try {
-          child = spawn('curl', ['-sL', '--max-time', '120', '-x', proxy, '-o', tarball, '--', url], { stdio: ['ignore', 'pipe', 'pipe'] })
+          child = spawn('curl', ['-sL', '--max-time', '120', '--max-filesize', String(MAX_TARBALL_BYTES), '-x', proxy, '-o', tarball, '--', url], { stdio: ['ignore', 'pipe', 'pipe'] })
         } catch (error) {
           reject(new Error('无法启动 curl：' + error.message)); return
         }
@@ -513,14 +535,20 @@ export function apply(ctx) {
         if (!res.ok) throw new Error('HTTP ' + res.status)
         const declared = Number(res.headers.get('content-length'))
         if (Number.isFinite(declared) && declared > MAX_TARBALL_BYTES) throw new Error('压缩包超过体积上限')
-        const buf = Buffer.from(await res.arrayBuffer())
-        if (buf.length > MAX_TARBALL_BYTES) throw new Error('压缩包超过体积上限')
-        await writeFile(tarball, buf)
+        const chunks = []
+        let total = 0
+        for await (const chunk of res.body) {
+          total += chunk.length
+          if (total > MAX_TARBALL_BYTES) throw new Error('压缩包超过体积上限')
+          chunks.push(Buffer.from(chunk))
+        }
+        await writeFile(tarball, Buffer.concat(chunks))
       } finally {
         clearTimeout(timer)
       }
     }
     if (statSync(tarball).size > MAX_TARBALL_BYTES) throw new Error('压缩包超过体积上限')
+    inspectArchive(tarball)
     const result = spawnSync('tar', ['-xzf', tarball, '-C', destDir, '--strip-components=1'], { timeout: 120000 })
     if (result.status !== 0) {
       const detail = (result.stderr && result.stderr.toString().trim()) || ('tar 退出码 ' + result.status)
