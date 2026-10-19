@@ -442,6 +442,7 @@ export function apply(ctx) {
   // ------------------------------------------------------------ 安装 / 移除
   /** 压缩包与解压产物的准入上限。 */
   const MAX_TARBALL_BYTES = 64 * 1024 * 1024
+  const MAX_MEMBER_BYTES = 64 * 1024 * 1024
   const MAX_TREE_BYTES = 256 * 1024 * 1024
   const MAX_TREE_ENTRIES = 20000
   const DIR_SEGMENT_RE = /^[A-Za-z0-9._-]+$/
@@ -486,7 +487,17 @@ export function apply(ctx) {
     walk(root)
   }
 
-  /** 解压前审计归档成员：拒绝绝对路径、`..`、链接与非常规类型。 */
+  /** 从 `tar -tvzf` 一行里取成员大小；GNU 与 bsdtar 两种列格式都认，认不出就失败关闭。 */
+  function parseTarSize(line) {
+    const gnu = /^[^\s]+\s+\S+\s+(\d+)\s+/.exec(line)
+    const bsd = /^[^\s]+\s+\d+\s+\S+\s+\S+\s+(\d+)\s+/.exec(line)
+    const match = bsd ?? gnu
+    if (match === null) return undefined
+    const size = Number(match[1])
+    return Number.isSafeInteger(size) && size >= 0 ? size : undefined
+  }
+
+  /** 解压前审计归档成员：类型、路径与展开体积（压缩炸弹防线）。 */
   function inspectArchive(tarball) {
     const listing = spawnSync('tar', ['-tzf', tarball], { timeout: 60000, maxBuffer: 32 * 1024 * 1024 })
     if (listing.status !== 0) throw new Error('归档清单读取失败')
@@ -500,11 +511,18 @@ export function apply(ctx) {
     }
     const verbose = spawnSync('tar', ['-tvzf', tarball], { timeout: 60000, maxBuffer: 32 * 1024 * 1024 })
     if (verbose.status !== 0) throw new Error('归档清单读取失败')
+    let expanded = 0
     for (const line of String(verbose.stdout).split(/\r?\n/)) {
       if (line === '') continue
       const type = line[0]
       if (type === 'l' || type === 'h') throw new Error('归档包含链接成员，已拒绝')
       if (type !== '-' && type !== 'd') throw new Error('归档包含非常规成员，已拒绝')
+      if (type !== '-') continue
+      const size = parseTarSize(line)
+      if (size === undefined) throw new Error('无法解析归档成员大小，已拒绝：' + line.slice(0, 80))
+      if (size > MAX_MEMBER_BYTES) throw new Error('归档单成员超过展开上限')
+      expanded += size
+      if (expanded > MAX_TREE_BYTES) throw new Error('归档展开体积超过上限')
     }
   }
 
