@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
       ".skx-btn-primary:not(:disabled):hover{background:var(--dsw-alias-interactive-bg-hover,#f0f0f0)}",
       ".skx-btn-danger{color:var(--dsw-alias-state-error-primary,#d4380d);border:1px solid rgba(212,56,13,.4)}",
       ".skx-card{box-sizing:border-box;padding:12px 0}",
-      ".skx-card+.skx-card{border-top:1px solid rgba(127,127,127,.48);padding-top:16px}",
+      ".skx-card+.skx-card{padding-top:16px}",
       ".skx-card-title{font-size:13px;font-weight:600;margin:0 0 6px}",
       ".skx-list{display:flex;flex-direction:column;gap:6px}",
       ".skx-item{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid rgba(127,127,127,.48);border-radius:14px}",
@@ -115,7 +115,7 @@ window.__ModuleLoader__.load({
         hasSelection ? h("div", null,
           h("div", { className: "skx-row", style: { marginTop: 12 } },
             h("span", { className: "skx-hint" }, "安装到："),
-            roots && [roots.global, roots.project].map((r) => h("label", { className: "skx-radio", key: r.key },
+            roots && [roots.global, ...(roots.workspaces || []).map((w) => ({ key: "workspace:" + w.id, label: w.title, path: w.path }))].map((r) => h("label", { className: "skx-radio", key: r.key },
               h("input", { type: "radio", name: "root", checked: rootKey === r.key, onChange: () => setRootKey(r.key) }),
               r.label + "（" + r.path + "）",
             )),
@@ -144,14 +144,14 @@ window.__ModuleLoader__.load({
       return h("div", { className: "skx-list" },
         keys.map((root) => h("div", { className: "skx-card", key: root },
           h("div", { className: "skx-card-title" }, root),
-          groups[root].map((it) => h("div", { className: "skx-item", key: it.name + "@" + it.root },
+          h("div", { className: "skx-list", style: { marginTop: 6 } }, groups[root].map((it) => h("div", { className: "skx-item", key: it.name + "@" + it.root },
             h("div", { className: "skx-item-main" },
               h("span", { className: "skx-item-name" }, it.name),
               it.source ? h("span", { className: "skx-meta" }, "　来自 " + it.source) : null,
               !it.exists ? h("span", { className: "skx-error" }, "　（目录已不存在）") : null,
             ),
             h("button", { className: "skx-btn skx-btn-danger", disabled: busy, onClick: () => onRemove(it) }, "移除"),
-          )),
+          ))),
         )));
     }
 
@@ -255,7 +255,7 @@ window.__ModuleLoader__.load({
         const dirs = Object.keys(sel);
         if (!repo || dirs.length === 0) return;
         setBusy(true); setError(""); setNotice("");
-        api("install", { repo: repo.meta.fullName, dirs: dirs.join(","), root: rootKey, customPath: rootKey === "custom" ? customPath : undefined }).then((r) => {
+        api("install", { repo: repo.meta.fullName, dirs: dirs.join(","), root: rootKey.indexOf("workspace:") === 0 ? "workspace" : rootKey, workspaceId: rootKey.indexOf("workspace:") === 0 ? rootKey.slice(10) : undefined, customPath: rootKey === "custom" ? customPath : undefined }).then((r) => {
           setBusy(false);
           if (!r.ok) { setError(r.error); return; }
           setNotice("已安装：" + r.installed.map((i) => i.name).join("、"));
@@ -266,7 +266,7 @@ window.__ModuleLoader__.load({
 
       const doRemove = useCallback((it) => {
         setBusy(true); setError(""); setNotice("");
-        api("remove", { root: it.scope === "custom" ? "custom" : it.scope, customPath: it.scope === "custom" ? it.root : undefined, dir: it.dir }).then((r) => {
+        api("remove", { root: (it.scope === "custom" || it.scope === "workspace") ? "custom" : it.scope, customPath: (it.scope === "custom" || it.scope === "workspace") ? it.root : undefined, dir: it.dir }).then((r) => {
           setBusy(false);
           if (!r.ok) { setError(r.error); return; }
           setNotice("已移除：" + it.name);

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Skill Install",
-    "description": "Install skills from GitHub repositories: search by name or paste a repo URL, pick SKILL.md files, and install them globally, per project, or to a custom directory."
+    "description": "Install skills from GitHub repositories: search by name or paste a repo URL, pick SKILL.md files, and install them globally, into a workspace, or to a custom directory."
   }
 }

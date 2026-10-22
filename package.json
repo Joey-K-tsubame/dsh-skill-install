@@ -1,6 +1,6 @@
 {
   "name": "dsh-skill-install",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "DeepSeek Harness 技能安装器：按名字搜索或直接输入 GitHub 仓库地址，列出仓库中的 SKILL.md 技能，勾选后安装到全局 / 当前项目 / 自定义目录，与内置 skill-filesystem 联动，装完即时生效。",
   "type": "module",
   "main": "index.js",

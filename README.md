@@ -14,9 +14,8 @@ installed skills take effect immediately — no restart required.
 - **Only matched repos**: search returns concrete matching repositories; click "Open" to browse their skills.
   There is no full-site discovery feed.
 - **Selectable target, global by default**:
-  - Global → `<dshHome>/skills` (watched by skill-filesystem by default)
-  - Current project → `<project root>/.dsh/skills` (project root = nearest `.git` ancestor, else cwd)
-  - Custom directory → any absolute directory; the plugin registers its own skill provider and hot-refreshes it
+  
+  Targets are **global** (`<DSH_HOME>/skills`), **a workspace** (`<workspace dir>/.dsh/skills`, read from the host registry), or **a custom absolute directory**. 
 - **Installed list**: grouped by target directory, one-click removal.
 - **Currently loaded skills**: the merged set from the built-in skill-filesystem and this plugin (read-only).
 - **Proxy (collapsed entry)**: configure a proxy address, test connectivity, or clear it; requests go through the
@@ -43,7 +42,7 @@ needs no `allowBuilds` code-execution approval.
 
 ## Skill-system integration
 
-- Global / project installs write into the standard roots watched by skill-filesystem, so the watcher hot-loads them;
+- Global / workspace installs write into the standard roots watched by skill-filesystem, so the watcher hot-loads them;
 - Custom directories are registered as an independent skill provider via `ctx.skills.registerProvider`, using the
   same discovery rules (`<root>/<name>/SKILL.md` or `<root>/<name>.md`), invalidated on install / remove / changes;
 - All routes and providers are registered with `ctx.effect`, so they are removed automatically on disable / reload.

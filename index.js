@@ -44,6 +44,13 @@ function clip(value, max) {
 export function apply(ctx) {
   const webServer = ctx.webServer
   const skills = ctx.get('skills')
+  // workspaceRegistry is optional: inject it so it is actually readable, and keep
+  // the plugin usable (global + custom only) when the host does not provide it.
+  let workspaceRegistry
+  ctx.inject(['workspaceRegistry'], (scope) => {
+    workspaceRegistry = scope.workspaceRegistry
+    scope.effect(() => () => { workspaceRegistry = undefined })
+  })
 
   // ------------------------------------------------------------------ paths
   function dshHomeDir() {
@@ -63,15 +70,26 @@ export function apply(ctx) {
     if (p.startsWith('~/') || p.startsWith('~\\')) return join(homedir(), p.slice(2))
     return p
   }
-  /** 当前项目根：最近含 .git 的祖先，否则进程 cwd（与 skill-filesystem 一致）。 */
-  function projectRootDir() {
-    let cur = resolve(process.cwd())
-    while (true) {
-      if (existsSync(join(cur, '.git'))) return cur
-      const parent = dirname(cur)
-      if (parent === cur) return resolve(process.cwd())
-      cur = parent
+  /** 宿主工作区（项目）= 绝对目录；拿不到注册表时返回空数组，UI 只剩全局与自定义。 */
+  function listWorkspaces() {
+    const registry = workspaceRegistry
+    if (!registry || typeof registry.list !== 'function') return []
+    let rows = []
+    try {
+      rows = registry.list()
+    } catch {
+      return []
     }
+    if (!Array.isArray(rows)) return []
+    return rows.map((w) => {
+      const path = [w?.path, w?.cwd, w?.dir, w?.root, w?.directory].find((v) => typeof v === 'string' && v !== '') ?? ''
+      if (path === '') return null
+      return {
+        id: String(w?.id ?? path),
+        title: String(w?.title ?? w?.name ?? path),
+        path,
+      }
+    }).filter(Boolean)
   }
 
   // ------------------------------------------------------------- settings
@@ -411,9 +429,13 @@ export function apply(ctx) {
   }
 
   // -------------------------------------------------------------- 目标目录
-  function rootTarget(rootKey, customPath) {
+  function rootTarget(rootKey, customPath, workspaceId) {
     if (rootKey === 'global') return { path: join(dshHomeDir(), 'skills'), custom: false, label: '全局' }
-    if (rootKey === 'project') return { path: join(projectRootDir(), '.dsh', 'skills'), custom: false, label: '当前项目' }
+    if (rootKey === 'workspace') {
+      const found = listWorkspaces().find((w) => w.id === String(workspaceId ?? ''))
+      if (found === undefined) throw new Error('工作区不存在：' + String(workspaceId))
+      return { path: join(found.path, '.dsh', 'skills'), custom: false, label: found.title }
+    }
     if (rootKey === 'custom') {
       const p = expandHome(customPath)
       if (p === '' || p === '.') throw new Error('自定义目录不能为空')
@@ -429,11 +451,10 @@ export function apply(ctx) {
   function rootsSummary() {
     const settings = loadSettings()
     const global = rootTarget('global')
-    const project = rootTarget('project')
     const customs = customDirs().map((path) => ({ key: 'custom', path, exists: existsSync(path) }))
     return {
       global: { key: 'global', label: '全局', path: global.path, exists: existsSync(global.path) },
-      project: { key: 'project', label: '当前项目', path: project.path, exists: existsSync(project.path) },
+      workspaces: listWorkspaces(),
       customs,
       default: 'global',
     }
@@ -575,10 +596,10 @@ export function apply(ctx) {
     sanitizeTree(destDir)
   }
 
-  async function installSkills(fullName, dirs, rootKey, customPath) {
+  async function installSkills(fullName, dirs, rootKey, customPath, workspaceId) {
     const meta = await repoMeta(fullName)
     const commit = await headCommit(fullName, meta.defaultBranch)
-    const target = rootTarget(rootKey, customPath)
+    const target = rootTarget(rootKey, customPath, workspaceId)
     const work = join(dshHomeDir(), SRC_DIR_NAME, Date.now().toString(36) + '-' + basename(fullName))
     await mkdir(work, { recursive: true })
     const installed = []
@@ -645,7 +666,7 @@ export function apply(ctx) {
       name: r.name,
       dir: r.dir,
       root: r.root,
-      scope: r.scope ?? (r.root === join(dshHomeDir(), 'skills') ? 'global' : r.root === join(projectRootDir(), '.dsh', 'skills') ? 'project' : 'custom'),
+      scope: r.scope ?? (r.root === join(dshHomeDir(), 'skills') ? 'global' : 'custom'),
       source: r.source ?? '',
       time: r.time ?? '',
       exists: existsSync(join(r.root, r.dir)),
@@ -875,10 +896,11 @@ export function apply(ctx) {
     const dirs = String(body.dirs ?? '').split(',').map((s) => s.trim()).filter((s) => s !== '')
     const rootKey = String(body.root ?? 'global').trim()
     const customPath = String(body.customPath ?? '').trim()
+    const workspaceId = String(body.workspaceId ?? '').trim()
     if (!REPO_RE.test(fullName)) throw new Error('仓库名无效：' + fullName)
     if (dirs.length === 0) throw new Error('未选择要安装的技能')
     if (dirs.length > 20) throw new Error('一次最多安装 20 个技能')
-    return await installSkills(fullName, dirs, rootKey, customPath)
+    return await installSkills(fullName, dirs, rootKey, customPath, workspaceId)
   })
 
   routeWrite('/skill-install/remove', async (body) => {
@@ -901,6 +923,19 @@ export function apply(ctx) {
         provider: s.provider,
         ...(s.path ? { path: s.path } : {}),
       }))
+    }
+    // Registry 只报它当前加载的技能；已装但尚未被加载器扫到的，按安装记录补进来，
+    // 免得刚装完的技能在「已加载」里看不到。
+    const seen = new Set(items.map((s) => s.name))
+    for (const record of installedRecords()) {
+      if (!record.exists || seen.has(record.name)) continue
+      items.push({
+        name: record.name,
+        description: '',
+        source: 'installed',
+        provider: 'skill-install',
+        path: record.root + '/' + record.dir,
+      })
     }
     return { ok: true, items }
   })
