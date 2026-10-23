@@ -3,7 +3,7 @@
  *
  * 一个轻量的技能安装器：在 Web 设置页里按名字搜索 GitHub 仓库，或直接输入
  * 仓库地址，列出该仓库中的 SKILL.md 技能，勾选后安装到可选目标目录
- * （全局 / 当前项目 / 自定义目录）。安装走 skill-filesystem 已监视的标准根，
+ * （全局 / 宿主工作区 / 自定义目录）。安装走 skill-filesystem 已监视的标准根，
  * 自定义目录由本插件自建 skill provider 服务并热刷新——装完即时生效。
  *
  * 零外部运行时依赖（js-yaml 以 ESM 构建内置于 ./js-yaml.mjs）。GitHub 抓取默认直连；
@@ -43,7 +43,13 @@ function clip(value, max) {
 
 export function apply(ctx) {
   const webServer = ctx.webServer
-  const skills = ctx.get('skills')
+  let skills = ctx.get('skills')
+  // Same optional-injection rule as workspaceRegistry: without it the skills
+  // registry reads as empty and "loaded" only ever showed this plugin's own rows.
+  ctx.inject(['skills'], (scope) => {
+    skills = scope.skills
+    scope.effect(() => () => { skills = undefined })
+  })
   // workspaceRegistry is optional: inject it so it is actually readable, and keep
   // the plugin usable (global + custom only) when the host does not provide it.
   let workspaceRegistry
@@ -671,7 +677,9 @@ export function apply(ctx) {
       time: r.time ?? '',
       exists: existsSync(join(r.root, r.dir)),
     }))
-    return records.sort((a, b) => (a.name < b.name ? -1 : 1))
+    // Global first, then workspaces, then custom directories.
+    const rank = (r) => (r.scope === 'global' ? 0 : r.scope === 'workspace' ? 1 : 2)
+    return records.sort((a, b) => rank(a) - rank(b) || (a.name < b.name ? -1 : 1))
   }
 
   // ----------------------------------------------- skills provider（自定义目录）
@@ -915,14 +923,80 @@ export function apply(ctx) {
   route('/skill-install/skills', async () => {
     let items = []
     if (skills) {
-      const list = await skills.list({})
-      items = list.map((s) => ({
-        name: s.name,
-        description: s.description,
-        source: s.source,
-        provider: s.provider,
-        ...(s.path ? { path: s.path } : {}),
-      }))
+      // The registry resolves skills per scope: no argument means the global
+      // roots only, which is why the '/' menu and this list disagreed. Query
+      // once per scope and keep the workspace title as the location label.
+      const seenNames = new Set()
+      const scopes = [
+        { scope: {}, location: '' },
+        ...listWorkspaces().map((w) => ({ scope: { cwd: w.path }, location: w.title })),
+      ]
+      for (const entry of scopes) {
+        let list = []
+        try {
+          list = await skills.list(entry.scope)
+        } catch {
+          list = []
+        }
+        if (!Array.isArray(list)) list = []
+        for (const s of list) {
+          if (s === null || typeof s !== 'object' || typeof s.name !== 'string' || seenNames.has(s.name)) continue
+          seenNames.add(s.name)
+          items.push({
+            name: s.name,
+            description: s.description,
+            source: s.source,
+            provider: s.provider,
+            ...(entry.location !== '' && s.source !== 'global' ? { location: entry.location } : {}),
+            ...(s.path ? { path: s.path } : {}),
+          })
+        }
+      }
+    }
+    // 宿主注册表不一定暴露给插件（或只报本会话可调用的技能），所以再扫一遍
+    // 已知的技能根目录，把文件系统里真实存在的 SKILL.md 也列出来。
+    {
+      const scanRoots = [
+        { dir: join(dshHomeDir(), 'skills'), location: '' },
+        ...listWorkspaces().map((w) => ({ dir: join(w.path, '.dsh', 'skills'), location: w.title })),
+        ...customDirs().map((d) => ({ dir: d, location: '自定义' })),
+      ]
+      for (const scan of scanRoots) {
+        if (!existsSync(scan.dir)) continue
+        let entries = []
+        try {
+          entries = readdirSync(scan.dir, { withFileTypes: true })
+        } catch {
+          continue
+        }
+        const candidates = []
+        for (const entry of entries) {
+          if (entry.isDirectory()) candidates.push({ fallback: entry.name, file: join(scan.dir, entry.name, 'SKILL.md') })
+          else if (entry.isFile() && entry.name.endsWith('.md')) candidates.push({ fallback: entry.name.replace(/\.md$/, ''), file: join(scan.dir, entry.name) })
+        }
+        for (const candidate of candidates) {
+          if (!existsSync(candidate.file)) continue
+          let parsed = null
+          try {
+            parsed = parseFrontmatter(readFileSync(candidate.file, 'utf8'))
+          } catch {
+            parsed = null
+          }
+          const name = typeof parsed?.data?.name === 'string' && parsed.data.name.trim() !== ''
+            ? parsed.data.name.trim()
+            : candidate.fallback
+          if (!SKILL_NAME_RE.test(name)) continue
+          if (items.some((s) => s.name === name)) continue
+          items.push({
+            name,
+            description: clip(parsed?.data?.description ?? '', 160),
+            source: 'filesystem',
+            provider: 'skills',
+            location: scan.location,
+            path: candidate.file,
+          })
+        }
+      }
     }
     // Registry 只报它当前加载的技能；已装但尚未被加载器扫到的，按安装记录补进来，
     // 免得刚装完的技能在「已加载」里看不到。

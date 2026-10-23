@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
       ".skx-btn-primary:not(:disabled):hover{background:var(--dsw-alias-interactive-bg-hover,#f0f0f0)}",
       ".skx-btn-danger{color:var(--dsw-alias-state-error-primary,#d4380d);border:1px solid rgba(212,56,13,.4)}",
       ".skx-card{box-sizing:border-box;padding:12px 0}",
-      ".skx-card+.skx-card{padding-top:16px}",
+      ".skx-card+.skx-card{border-top:1px solid rgba(127,127,127,.48);padding-top:16px}",
       ".skx-card-title{font-size:13px;font-weight:600;margin:0 0 6px}",
       ".skx-list{display:flex;flex-direction:column;gap:6px}",
       ".skx-item{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid rgba(127,127,127,.48);border-radius:14px}",
@@ -115,10 +115,19 @@ window.__ModuleLoader__.load({
         hasSelection ? h("div", null,
           h("div", { className: "skx-row", style: { marginTop: 12 } },
             h("span", { className: "skx-hint" }, "安装到："),
-            roots && [roots.global, ...(roots.workspaces || []).map((w) => ({ key: "workspace:" + w.id, label: w.title, path: w.path }))].map((r) => h("label", { className: "skx-radio", key: r.key },
-              h("input", { type: "radio", name: "root", checked: rootKey === r.key, onChange: () => setRootKey(r.key) }),
-              r.label + "（" + r.path + "）",
-            )),
+            roots && h("label", { className: "skx-radio", key: "global" },
+              h("input", { type: "radio", name: "root", checked: rootKey === "global", onChange: () => setRootKey("global") }),
+              roots.global.label + "（" + roots.global.path + "）",
+            ),
+            roots && (roots.workspaces || []).length > 0 && h("details", { style: { marginRight: 12 } },
+              h("summary", { className: "skx-hint", style: { cursor: "pointer" } }, "工作区（" + roots.workspaces.length + "）"),
+              h("div", { className: "skx-list", style: { marginTop: 6 } },
+                roots.workspaces.map((w) => h("label", { className: "skx-radio", key: w.id },
+                  h("input", { type: "radio", name: "root", checked: rootKey === "workspace:" + w.id, onChange: () => setRootKey("workspace:" + w.id) }),
+                  w.title + "（" + w.path + "）",
+                )),
+              ),
+            ),
             h("label", { className: "skx-radio" },
               h("input", { type: "radio", name: "root", checked: rootKey === "custom", onChange: () => setRootKey("custom") }),
               "自定义",
@@ -141,9 +150,11 @@ window.__ModuleLoader__.load({
       for (const it of items) (groups[it.root] = groups[it.root] || []).push(it);
       const keys = Object.keys(groups);
       if (keys.length === 0) return h("p", { className: "skx-sub" }, "尚未安装任何技能。");
-      return h("div", { className: "skx-list" },
-        keys.map((root) => h("div", { className: "skx-card", key: root },
-          h("div", { className: "skx-card-title" }, root),
+      return h("details", { className: "skx-card", open: true },
+        h("summary", { className: "skx-card-title", style: { cursor: "pointer" } }, "已安装"),
+        h("div", { className: "skx-list", style: { marginTop: 6 } },
+        keys.map((root) => h("div", { key: root },
+          h("div", { className: "skx-card-title", style: { marginTop: 10 } }, root),
           h("div", { className: "skx-list", style: { marginTop: 6 } }, groups[root].map((it) => h("div", { className: "skx-item", key: it.name + "@" + it.root },
             h("div", { className: "skx-item-main" },
               h("span", { className: "skx-item-name" }, it.name),
@@ -152,7 +163,7 @@ window.__ModuleLoader__.load({
             ),
             h("button", { className: "skx-btn skx-btn-danger", disabled: busy, onClick: () => onRemove(it) }, "移除"),
           ))),
-        )));
+        ))));
     }
 
     function LoadedList({ items }) {
@@ -162,6 +173,7 @@ window.__ModuleLoader__.load({
           h("div", { className: "skx-item-main" },
             h("span", { className: "skx-item-name" }, s.name),
             h("span", { className: "skx-tag", style: { marginLeft: 6 } }, s.provider || s.source || "skills"),
+            s.location ? h("span", { className: "skx-meta", style: { marginLeft: 6 } }, "· " + s.location) : null,
             s.description ? h("div", { className: "skx-item-desc" }, s.description) : null,
           ),
         )));
@@ -282,7 +294,7 @@ window.__ModuleLoader__.load({
 
       return h("div", { className: "skx-root" },
         h("h2", { className: "skx-title" }, "技能"),
-        h("p", { className: "skx-sub" }, "按名字搜索 GitHub 仓库，或直接输入 owner/repo 或完整仓库地址；勾选仓库中的 SKILL.md 技能，安装到全局 / 当前项目 / 自定义目录。装完即时生效。"),
+        h("p", { className: "skx-sub" }, "按名字搜索 GitHub 仓库，或直接输入 owner/repo 或完整仓库地址；勾选仓库中的 SKILL.md 技能，安装到全局 / 某个工作区 / 自定义目录。装完即时生效。"),
         error ? h("div", { className: "skx-error" }, error) : null,
         notice ? h("div", { className: "skx-ok" }, notice) : null,
 
